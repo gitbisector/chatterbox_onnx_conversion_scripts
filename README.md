@@ -40,6 +40,7 @@ This project aims to make it easier to:
 | -----------------         | ------------------------  | -------------------------------------  | ---------------                                          | ------------
 | Chatterbox                | resemble-ai/chatterbox-tts| Text to Speech, Speech to Speech       | [GitHub Link](https://github.com/resemble-ai/chatterbox) | [HF Link](https://huggingface.co/onnx-community/chatterbox-ONNX)
 | Chatterbox Multilingual   | resemble-ai/chatterbox-tts| Text to Speech, Speech to Speech       | [GitHub Link](https://github.com/resemble-ai/chatterbox) | [HF Link](https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX)
+| Perth Watermarker         | resemble-ai/Perth         | Speech to Speech                       | [GitHub Link](https://github.com/resemble-ai/Perth)      | [HF Link](https://huggingface.co/onnx-community/perth-watermarker-ONNX)
 | ...                       | ...                       | ...                                    | ...                                                      | ...
 
 (More models coming soon!)

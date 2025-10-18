@@ -120,14 +120,14 @@ class ImplicitWatermarker(nn.Module):
     def __init__(self, model, fixed_sample_rate: int):
         super().__init__()
         self.perth_net = model.perth_net
-        self.default_sample_rate = torch.tensor([model.perth_net.hp.sample_rate])
+        self.default_sample_rate = model.perth_net.hp.sample_rate
+        self.fixed_sample_rate = fixed_sample_rate
         self.istft = istft
         self.hp = model.perth_net.hp
         self.n_fft = model.perth_net.hp.n_fft
         self.win_length = model.perth_net.hp.window_size
         self.hop_length = model.perth_net.hp.hop_size
         self.window = model.perth_net.ap.spectrogram.window
-        self.fixed_sample_rate = fixed_sample_rate
     
     def spectrogram(
         self,

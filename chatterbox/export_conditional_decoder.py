@@ -1,19 +1,39 @@
 """Export Chatterbox's conditional decoder (speech tokens → waveform).
 
-This module combines three stages into a single ONNX graph
-``conditional_decoder.onnx``:
+This module wraps Chatterbox's S3Gen vocoder (flow encoder + CFM UNet + HiFi-GAN)
+for end-to-end ONNX export and differs from the original monolithic export in
+three ways:
 
-1. **Encoder** — upsample speech tokens to mel-spectrogram conditioning
-2. **CFM (Conditional Flow Matching)** — N Euler steps that denoise a Gaussian
-   into a clean mel-spectrogram. The step count is fixed at export time.
-3. **HiFi-GAN** — convert the mel-spectrogram to 24 kHz waveform. Uses a local
-   ``ISTFT`` implementation to avoid the non-traceable torch.istft.
+1. **Parameterized CFM step count.**  The original export baked exactly
+   10 Euler steps for the diffusion-like flow-matching loop into the graph.
+   This implementation accepts ``n_cfm_timesteps`` at construction so the
+   caller can export variants for different speed/quality trade-offs
+   (e.g. N=4 for real-time, N=10 for reference quality).
 
-The original monolithic export lived in ``chatterbox_to_onnx_conversion_script.py``;
-this split separates it from the speech encoder and embed tokens exports without
-changing behavior.
+2. **Scatter-free graph.**  The upstream ``solve_euler`` used ``x_in[:].copy_(x)``
+   inside a runtime Python loop, producing ``ScatterND`` nodes that prevent
+   ORT CUDA-graph capture.  Here the loop is Python-unrolled at trace time
+   (N steps baked in) and the batched CFG tensors are rebuilt every step
+   via ``torch.cat([..., zeros_like(...)], dim=0)`` — scatter-free.
+
+3. **Scatter-free SineGen.**  The HiFi-GAN's original ``SineGen`` built the
+   harmonic frequency matrix via a per-row in-place loop
+   (``F_mat[:, i:i+1, :] = f0 * (i+1) / sr``), yielding ``harmonic_num+1``
+   ScatterND nodes on its own.  Here we replace it with a single broadcast
+   multiply over a ``(1, H, 1)`` harmonic-index tensor.
+
+4. **Custom torch-exportable ISTFT / STFT.**  ``torch.istft`` does not export
+   cleanly; we replace it with ``CustomISTFT`` (conv_transpose1d-based).
+   ``torch.stft(..., return_complex=True) + view_as_real`` is replaced with
+   ``torch.stft(..., return_complex=False)``.
+
+Interface: constructor ``ConditionalDecoder(chatterbox_model, n_cfm_timesteps=10)``;
+forward takes ``(speech_tokens, speaker_embeddings, speaker_features)`` and
+returns ``waveform``.  Backward-compatible with the original 1-arg
+``ConditionalDecoder(chatterbox_model)`` call used by the driver.
 """
 import math
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -30,77 +50,65 @@ from ._constants import (
 )
 
 
+# Derived constants — pulled from CFM_PARAMS / ISTFT_PARAMS so we read the
+# authoritative values and can't drift from them silently.
+INFERENCE_CFG_RATE = float(CFM_PARAMS["inference_cfg_rate"])  # 0.7
+ISTFT_N_FFT = int(ISTFT_PARAMS["n_fft"])                      # 16
+ISTFT_HOP_LEN = int(ISTFT_PARAMS["hop_len"])                  # 4
+N_TRIM = S3GEN_SR // 50                                       # 480 samples = 20ms fade-in
 
 
-class ISTFT(torch.nn.Module):
+class CustomISTFT(nn.Module):
+    """
+    ConvTranspose1d-based inverse STFT. Exports cleanly to ONNX (unlike the
+    native torch.istft, which emits a custom op). Adapted from the reference
+    conversion script at:
+      /tmp/onnx_conversion_scripts/chatterbox/chatterbox_to_onnx_conversion_script.py
+    """
+
     def __init__(self, n_fft: int, hop_length: int, win_length: int):
-        assert n_fft >= win_length
         super().__init__()
-
+        assert n_fft >= win_length
         self.filter_length = n_fft
         self.win_length = win_length
         self.hop_length = hop_length
 
         scale = self.filter_length / self.hop_length
         fourier_basis = np.fft.fft(np.eye(self.filter_length))
-
         cutoff = self.filter_length // 2 + 1
-        fourier_basis = np.vstack([np.real(fourier_basis[:cutoff, :]),
-                                   np.imag(fourier_basis[:cutoff, :])])
+        fourier_basis = np.vstack(
+            [np.real(fourier_basis[:cutoff, :]), np.imag(fourier_basis[:cutoff, :])]
+        )
+        inverse_basis = torch.FloatTensor(
+            np.linalg.pinv(scale * fourier_basis).T[:, None, :]
+        )
 
-        inverse_basis = torch.FloatTensor(np.linalg.pinv(scale * fourier_basis).T[:, None, :])
-
-
-        self.window = torch.hann_window(win_length)
-
-        # Center pad the window to the size of n_fft
-        pad_length = n_fft - self.window.size(0)
+        window = torch.hann_window(win_length)
+        pad_length = n_fft - window.size(0)
         pad_left = pad_length // 2
         pad_right = pad_length - pad_left
-
-        torch_fft_window = F.pad(self.window, (pad_left, pad_right), mode='constant', value=0)
+        torch_fft_window = F.pad(window, (pad_left, pad_right), mode="constant", value=0)
         inverse_basis *= torch_fft_window
 
-        self.register_buffer('inverse_basis', inverse_basis.float())
+        self.register_buffer("inverse_basis", inverse_basis.float(), persistent=False)
+        self.register_buffer("window", window, persistent=False)
 
     @staticmethod
-    def window_sumsquare(
-        window,
-        n_frames,
-        hop_length,
-        win_length,
-        n_fft,
-    ):
-        if win_length is None:
-            win_length = n_fft
-
-        n = n_fft + hop_length * (n_frames - 1)
-
-        # Compute the squared window at the desired length
-        win_sq = window ** 2
-
-        # Center pad the window to the size of n_fft
+    def _window_sumsquare(window, n_frames, hop_length, win_length, n_fft):
+        win_sq = window**2
         pad_length = n_fft - win_sq.size(0)
         pad_left = pad_length // 2
         pad_right = pad_length - pad_left
-        win_sq = F.pad(win_sq, (pad_left, pad_right), mode='constant', value=0)
+        win_sq = F.pad(win_sq, (pad_left, pad_right), mode="constant", value=0)
+        win_sq = win_sq.unsqueeze(0).unsqueeze(0)
 
-        # Prepare the kernel for conv_transpose1d
-        win_sq = win_sq.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, n_fft)
-
-        # Create the input signal: ones of shape (1, 1, n_frames)
         s = torch.ones(1, 1, n_frames, dtype=window.dtype, device=window.device)
-
-        # Perform conv_transpose1d with stride=hop_length
         x = F.conv_transpose1d(s, win_sq, stride=hop_length).squeeze()
+        n = n_fft + hop_length * (n_frames - 1)
+        return x[:n]
 
-        # Adjust x to have length n
-        x = x[:n]
-
-        return x
-
-    def forward(self, recombine_magnitude_phase):
-        assert recombine_magnitude_phase.dim() == 3, 'must be [B, 2 * N, T]'
+    def forward(self, recombine_magnitude_phase: torch.Tensor) -> torch.Tensor:
+        assert recombine_magnitude_phase.dim() == 3, "must be [B, 2*N, T]"
         num_frames = recombine_magnitude_phase.size(-1)
 
         inverse_transform = F.conv_transpose1d(
@@ -110,121 +118,142 @@ class ISTFT(torch.nn.Module):
             padding=0,
         )
 
-        window_sum = self.window_sumsquare(
+        window_sum = self._window_sumsquare(
             self.window,
             n_frames=num_frames,
             hop_length=self.hop_length,
             win_length=self.win_length,
             n_fft=self.filter_length,
         )
-
         tiny_value = torch.finfo(window_sum.dtype).tiny
-
         denom = torch.where(
             window_sum > tiny_value,
             window_sum,
             torch.tensor(1.0, dtype=window_sum.dtype, device=window_sum.device),
         )
-        # Apply the transformation
-        inverse_transform /= denom
-
-        # scale by hop ratio
-        inverse_transform *= self.filter_length / self.hop_length
+        inverse_transform = inverse_transform / denom
+        inverse_transform = inverse_transform * (self.filter_length / self.hop_length)
 
         q = self.filter_length // 2
-        inverse_transform = inverse_transform[:, 0, q:-q]
-        return inverse_transform
+        return inverse_transform[:, 0, q:-q]
 
-istft = ISTFT(ISTFT_PARAMS["n_fft"], ISTFT_PARAMS["hop_len"], ISTFT_PARAMS["n_fft"])
-
-
-def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
-    """Make mask tensor containing indices of padded part.
-
-    See description of make_non_pad_mask.
-
-    Args:
-        lengths (torch.Tensor): Batch of lengths (B,).
-    Returns:
-        torch.Tensor: Mask tensor containing indices of padded part.
-
-    Examples:
-        >>> lengths = [5, 3, 2]
-        >>> make_pad_mask(lengths)
-        masks = [[0, 0, 0, 0 ,0],
-                    [0, 0, 0, 1, 1],
-                    [0, 0, 1, 1, 1]]
-    """
-    batch_size = lengths.size(0)
-    max_len = max_len if max_len > 0 else lengths.max()
-    seq_range = torch.arange(0,
-                            max_len,
-                            dtype=torch.int64,
-                            device=lengths.device)
-    seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_len)
-    seq_length_expand = lengths.unsqueeze(-1)
-    mask = seq_range_expand >= seq_length_expand
-    return mask
-
-def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    assert mask.dtype == torch.bool
-    assert dtype in [torch.float32, torch.bfloat16, torch.float16]
-    mask = mask.to(dtype)
-    mask = (1.0 - mask) * -1.0e+10
-    return mask
 
 
 class ConditionalDecoder(nn.Module):
-    def __init__(self, model):
+    """
+    Wraps the S3Gen flow encoder + CFM UNet estimator + HiFi-GAN vocoder for
+    end-to-end ONNX export.
+
+    Key differences from chatterbox.models.s3gen's runtime path:
+      * CFM loop is Python-unrolled N times at trace time (`n_timesteps`
+        fixed at construction); this replaces the runtime `solve_euler` loop
+        which uses in-place `.copy_()` and produces ScatterND.
+      * The CFG-batched tensors `x_in, mask_in, mu_in, ...` are rebuilt each
+        step via `torch.cat(...,[zeros_like(...)], dim=0)`. This is cheap
+        (all tensors are cond + zeros) and scatter-free.
+      * `torch.stft(..., return_complex=True) + view_as_real` is replaced
+        with `torch.stft(..., return_complex=False)`.
+      * `torch.istft` is replaced with `CustomISTFT` (conv_transpose1d).
+      * The per-CFG-step estimator forward skips `add_optional_chunk_mask`
+        (static_chunk_size == 0, so it's equivalent to just the mask).
+    """
+
+    def __init__(self, chatterbox_or_s3gen, n_cfm_timesteps: int = 10):
+        """Accept either a full chatterbox TTS model (``.s3gen`` will be extracted)
+        or a bare ``s3gen`` module, for backward compatibility with the driver's
+        ``ConditionalDecoder(chatterbox_model)`` invocation."""
         super().__init__()
-        self.output_size = model.s3gen.flow.output_size
-        self.input_embedding = model.s3gen.flow.input_embedding
-        self.spk_embed_affine_layer = model.s3gen.flow.spk_embed_affine_layer
-        self.encoder = model.s3gen.flow.encoder
-        self.encoder_proj = model.s3gen.flow.encoder_proj
-        self.time_embeddings = model.s3gen.flow.decoder.estimator.time_embeddings
-        self.time_mlp = model.s3gen.flow.decoder.estimator.time_mlp
-        self.up_blocks = model.s3gen.flow.decoder.estimator.up_blocks
-        self.static_chunk_size = model.s3gen.flow.decoder.estimator.static_chunk_size
-        self.mid_blocks = model.s3gen.flow.decoder.estimator.mid_blocks
-        self.down_blocks = model.s3gen.flow.decoder.estimator.down_blocks
-        self.final_block = model.s3gen.flow.decoder.estimator.final_block
-        self.final_proj = model.s3gen.flow.decoder.estimator.final_proj
-        self.n_fft = ISTFT_PARAMS["n_fft"]
-        self.hop_len = ISTFT_PARAMS["hop_len"]
-        self.n_trim = S3GEN_SR // 50
-        self.stft_window = model.s3gen.mel2wav.stft_window
-        self.f0_predictor = model.s3gen.mel2wav.f0_predictor
-        self.f0_upsamp = model.s3gen.mel2wav.f0_upsamp
-        self.m_source = model.s3gen.mel2wav.m_source
-        self.inference_cfg_rate = 0.7
-        self.conv_pre = model.s3gen.mel2wav.conv_pre
-        self.lrelu_slope = model.s3gen.mel2wav.lrelu_slope
-        self.reflection_pad = model.s3gen.mel2wav.reflection_pad
-        self.ups = model.s3gen.mel2wav.ups
-        self.source_downs = model.s3gen.mel2wav.source_downs
-        self.source_resblocks = model.s3gen.mel2wav.source_resblocks
-        self.resblocks = model.s3gen.mel2wav.resblocks
-        self.conv_post = model.s3gen.mel2wav.conv_post
-        self.istft = istft
-    
-    def cond_forward(self, x, mask, mu, t, spks, cond) -> torch.Tensor:
-        """Forward pass of the UNet1DConditional model.
+        # Figure out whether we were handed chatterbox or its s3gen sub-module.
+        s3gen = getattr(chatterbox_or_s3gen, "s3gen", chatterbox_or_s3gen)
 
-        Args:
-            x (torch.Tensor): shape (batch_size, in_channels, time)
-            mask (_type_): shape (batch_size, 1, time)
-            t (_type_): shape (batch_size)
-            spks (_type_, optional): shape: (batch_size, condition_channels). Defaults to None.
-            cond (_type_, optional): placeholder for future use. Defaults to None.
+        self.n_timesteps = int(n_cfm_timesteps)
+        self.inference_cfg_rate = INFERENCE_CFG_RATE
+        self.n_trim = N_TRIM
+        self.n_fft = ISTFT_N_FFT
+        self.hop_len = ISTFT_HOP_LEN
+
+        # ---- Flow encoder (speech_tokens -> mu) ----
+        flow = s3gen.flow
+        self.output_size = flow.output_size          # == 80
+        self.input_embedding = flow.input_embedding
+        self.spk_embed_affine_layer = flow.spk_embed_affine_layer
+        self.encoder = flow.encoder
+        self.encoder_proj = flow.encoder_proj
+        self.pre_lookahead_len = flow.pre_lookahead_len
+        self.token_mel_ratio = flow.token_mel_ratio
+
+        # ---- CFM UNet estimator ----
+        est = flow.decoder.estimator
+        self.time_embeddings = est.time_embeddings
+        self.time_mlp = est.time_mlp
+        self.down_blocks = est.down_blocks            # 1 block for channels=[256]
+        self.mid_blocks = est.mid_blocks              # 12 blocks
+        self.up_blocks = est.up_blocks                # 1 block
+        self.final_block = est.final_block
+        self.final_proj = est.final_proj
+        # meanflow / static chunk are both unused here (static_chunk_size==0)
+
+        # ---- HiFi-GAN mel2wav ----
+        mel2wav = s3gen.mel2wav
+        self.conv_pre = mel2wav.conv_pre
+        self.lrelu_slope = mel2wav.lrelu_slope
+        self.reflection_pad = mel2wav.reflection_pad
+        self.ups = mel2wav.ups
+        self.num_upsamples = mel2wav.num_upsamples
+        self.num_kernels = mel2wav.num_kernels
+        self.source_downs = mel2wav.source_downs
+        self.source_resblocks = mel2wav.source_resblocks
+        self.resblocks = mel2wav.resblocks
+        self.conv_post = mel2wav.conv_post
+        self.f0_predictor = mel2wav.f0_predictor
+        self.f0_upsamp = mel2wav.f0_upsamp
+        self.m_source = mel2wav.m_source
+        self.audio_limit = mel2wav.audio_limit
+        self.register_buffer(
+            "stft_window", mel2wav.stft_window.float().clone(), persistent=False
+        )
+
+        # trim_fade ramp (fixed)
+        trim_fade = torch.zeros(2 * self.n_trim)
+        trim_fade[self.n_trim :] = (
+            torch.cos(torch.linspace(torch.pi, 0, self.n_trim)) + 1
+        ) / 2
+        self.register_buffer("trim_fade", trim_fade.float(), persistent=False)
+
+        # Custom ISTFT replacing torch.istft
+        self.istft = CustomISTFT(self.n_fft, self.hop_len, self.n_fft)
+
+        # Precomputed sine-gen phase offset. Upstream samples this at runtime
+        # from U(-pi, pi). We bake it in as a constant buffer so the trace
+        # does not emit aten::uniform (which opset 17 cannot export).
+        # Index 0 stays at 0 (matches upstream's `phase_vec[:, 0, :] = 0`).
+        sg = self.m_source.l_sin_gen
+        H = sg.harmonic_num + 1
+        g = torch.Generator().manual_seed(17)
+        phase_vec = torch.empty(1, H, 1).uniform_(
+            -float(torch.pi), float(torch.pi), generator=g
+        )
+        phase_vec[:, 0, :] = 0
+        self.register_buffer("sine_phase_vec", phase_vec.float(), persistent=False)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _mask_to_bias(mask_bool: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        mask = mask_bool.to(dtype)
+        return (1.0 - mask) * -1.0e10
+
+    def _cond_forward(self, x, mask, mu, t, spks, cond) -> torch.Tensor:
+        """Single UNet estimator call (equivalent to decoder.py ConditionalDecoder.forward
+        with static_chunk_size==0, meanflow=False).
         """
-
         t = self.time_embeddings(t).to(t.dtype)
         t = self.time_mlp(t)
 
         x = torch.cat([x, mu], dim=1)
-        spks = spks.unsqueeze(-1).expand(-1, -1, x.shape[-1])
-        x = torch.cat([x, spks], dim=1)
+        spks_exp = spks.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+        x = torch.cat([x, spks_exp], dim=1)
         x = torch.cat([x, cond], dim=1)
 
         masks = [mask]
@@ -232,15 +261,11 @@ class ConditionalDecoder(nn.Module):
         mask_down = masks[-1]
         x = resnet(x, mask_down, t)
         x = x.permute(0, 2, 1).contiguous()
-        attn_mask = mask_to_bias(mask_down.bool() == 1, x.dtype)
+        attn_mask = self._mask_to_bias(mask_down.bool(), x.dtype)
         for transformer_block in transformer_blocks:
-            x = transformer_block(
-                hidden_states=x,
-                attention_mask=attn_mask,
-                timestep=t,
-            )
+            x = transformer_block(hidden_states=x, attention_mask=attn_mask, timestep=t)
         x = x.permute(0, 2, 1).contiguous()
-        residual = x  # Save hidden states for skip connections
+        skip = x
         x = downsample(x * mask_down)
         masks.append(mask_down[:, :, ::2])
         masks = masks[:-1]
@@ -249,289 +274,277 @@ class ConditionalDecoder(nn.Module):
         for resnet, transformer_blocks in self.mid_blocks:
             x = resnet(x, mask_mid, t)
             x = x.permute(0, 2, 1).contiguous()
-            attn_mask = mask_to_bias(mask_mid.bool() == 1, x.dtype)
+            attn_mask = self._mask_to_bias(mask_mid.bool(), x.dtype)
             for transformer_block in transformer_blocks:
                 x = transformer_block(
-                    hidden_states=x,
-                    attention_mask=attn_mask,
-                    timestep=t,
+                    hidden_states=x, attention_mask=attn_mask, timestep=t
                 )
-            x = x.permute(0, 2, 1).contiguous() 
+            x = x.permute(0, 2, 1).contiguous()
 
         resnet, transformer_blocks, upsample = self.up_blocks[0]
         mask_up = masks.pop()
-        x = torch.cat([x[:, :, :residual.shape[-1]], residual], dim=1)
+        x = torch.cat([x[:, :, : skip.shape[-1]], skip], dim=1)
         x = resnet(x, mask_up, t)
         x = x.permute(0, 2, 1).contiguous()
-        attn_mask = mask_to_bias(mask_up.bool() == 1, x.dtype)
+        attn_mask = self._mask_to_bias(mask_up.bool(), x.dtype)
         for transformer_block in transformer_blocks:
-            x = transformer_block(
-                hidden_states=x,
-                attention_mask=attn_mask,
-                timestep=t,
-            )
+            x = transformer_block(hidden_states=x, attention_mask=attn_mask, timestep=t)
         x = x.permute(0, 2, 1).contiguous()
         x = upsample(x * mask_up)
         x = self.final_block(x, mask_up)
-        output = self.final_proj(x * mask_up)
-        return output
+        return self.final_proj(x * mask_up)
 
-    def flow_forward(self, speech_tokens, token_len, mask, embedding, prompt_feat):
+    def _flow_encode(
+        self,
+        speech_tokens: torch.Tensor,
+        speaker_embeddings: torch.Tensor,
+        speaker_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the flow encoder to get mu, spks, cond, mask, mel_len1."""
+        B = speech_tokens.size(0)
         # xvec projection
-        embedding = F.normalize(embedding, dim=1)
-        embedding = self.spk_embed_affine_layer(embedding)
+        embedding = F.normalize(speaker_embeddings, dim=1)
+        embedding = self.spk_embed_affine_layer(embedding)  # (B, 80)
 
-        # concat text and prompt_text
-        speech_tokens = self.input_embedding(torch.clamp(speech_tokens, min=0))
-        speech_tokens = speech_tokens * mask
+        # token embedding
+        token_len = torch.full(
+            (B,), speech_tokens.size(1), dtype=torch.long, device=speech_tokens.device
+        )
+        # 1 for non-pad (B, T, 1); we assume no padding inside the batch.
+        tmask = torch.ones(
+            B, speech_tokens.size(1), 1, dtype=speaker_embeddings.dtype,
+            device=speech_tokens.device,
+        )
+        tok_emb = self.input_embedding(torch.clamp(speech_tokens, min=0).long())
+        tok_emb = tok_emb * tmask
 
-        # text encode
-        text_encoded, _ = self.encoder(speech_tokens, token_len)
-        mel_len1, mel_len2 = prompt_feat.shape[1], text_encoded.shape[1] - prompt_feat.shape[1]
-        text_encoded = self.encoder_proj(text_encoded)
+        # conformer encoder -> (B, T*ratio, C)
+        h, h_masks = self.encoder(tok_emb, token_len)
+        # (skip pre-lookahead trim; for inference `finalize=True`)
+        h_lengths = h_masks.sum(dim=-1).squeeze(dim=-1)
+        mel_len1 = speaker_features.shape[1]
+        h = self.encoder_proj(h)  # (B, T_mel, 80)
 
-        # get conditions
-        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size]).to(text_encoded.dtype)
-        conds[:, :mel_len1] = prompt_feat
-        conds = conds.transpose(1, 2)
+        mel_total = h.shape[1]
+        # conds[:, :mel_len1] = speaker_features
+        # NOTE: we build it scatter-free via cat(prompt, zeros)
+        pad_feat = torch.zeros(
+            B, mel_total - mel_len1, self.output_size,
+            dtype=h.dtype, device=h.device,
+        )
+        conds = torch.cat([speaker_features, pad_feat], dim=1).transpose(1, 2)  # (B, 80, T_mel)
 
-        mu = text_encoded
-        spks = embedding
-        if not isinstance(mel_len1, torch.Tensor):
-            mel_len1 = torch.tensor(mel_len1, device=speech_tokens.device)
-        if not isinstance(mel_len2, torch.Tensor):
-            mel_len2 = torch.tensor(mel_len2, device=speech_tokens.device)
-        return mel_len1, mel_len2, mu, spks, conds
+        mu = h.transpose(1, 2).contiguous()  # (B, 80, T_mel)
 
-    def decode(self, x: torch.Tensor, s_stft: torch.Tensor) -> torch.Tensor:
-        x = self.conv_pre(x)
+        # mask for the mel: (B, 1, T_mel), 1 for non-pad. h_lengths==T_mel in
+        # our single-batch inference.
+        mask = torch.ones(
+            B, 1, mel_total, dtype=h.dtype, device=h.device,
+        )
+        return mel_len1, mu, embedding, conds, mask
 
-        # ---- Upsample 0 ----
+    # ------------------------------------------------------------------
+    # CFM Euler solver, Python-unrolled and scatter-free.
+    # ------------------------------------------------------------------
+    def _cfm_solve(self, mu, mask, spks, cond):
+        """
+        Args:
+          mu:   (B, 80, T_mel)
+          mask: (B, 1,  T_mel)
+          spks: (B, 80)
+          cond: (B, 80, T_mel)
+        Returns:
+          x: (B, 80, T_mel)
+        """
+        x = torch.randn_like(mu) * 1.0
+        t_span = torch.linspace(
+            0, 1, self.n_timesteps + 1, device=mu.device, dtype=mu.dtype
+        )
+        t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+
+        # Zero buffers for the uncond half (matches upstream's initial
+        # torch.zeros([2*B, ...]) with only the cond half getting written).
+        # Upstream DOES duplicate x, mask and t across both halves (see
+        # `x_in[:B] = x_in[B:] = x` pattern in
+        # chatterbox.models.s3gen.flow_matching.ConditionalCFM.solve_euler).
+        # Only mu, spks and cond are zeroed in the uncond half.
+        zeros_mu = torch.zeros_like(mu)
+        zeros_spks = torch.zeros_like(spks)
+        zeros_cond = torch.zeros_like(cond)
+
+        # Python-unrolled loop -- n_timesteps fixed at construction time.
+        # Each iteration builds fresh batched CFG tensors via cat, which
+        # avoids the ScatterND produced by the upstream in-place .copy_().
+        for step in range(self.n_timesteps):
+            t = t_span[step : step + 1]
+            dt = t_span[step + 1 : step + 2] - t
+
+            # Build (2B, ...) CFG-batched tensors.
+            # cond half  =  (x,   mask, mu,      t, spks,      cond)
+            # uncond half = (x,   mask, zeros,   t, zeros,     zeros)
+            t_single = t.expand(x.size(0))
+            x_in = torch.cat([x, x], dim=0)
+            mask_in = torch.cat([mask, mask], dim=0)
+            mu_in = torch.cat([mu, zeros_mu], dim=0)
+            t_in = torch.cat([t_single, t_single], dim=0)
+            spks_in = torch.cat([spks, zeros_spks], dim=0)
+            cond_in = torch.cat([cond, zeros_cond], dim=0)
+
+            dphi_dt = self._cond_forward(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
+            dphi_dt_cond, dphi_dt_uncond = torch.split(
+                dphi_dt, [x.size(0), x.size(0)], dim=0
+            )
+            combined = (1.0 + self.inference_cfg_rate) * dphi_dt_cond \
+                       - self.inference_cfg_rate * dphi_dt_uncond
+            x = x + dt * combined
+
+        return x
+
+    # ------------------------------------------------------------------
+    # Scatter-free SineGen. Upstream does `F_mat[:, i:i+1, :] = f0 * (i+1)/sr`
+    # inside a Python loop, which produces harmonic_num+1 ScatterND nodes.
+    # We replace that with torch.arange + broadcast to build the full harmonic
+    # bank in one multiply. Logically identical.
+    # ------------------------------------------------------------------
+    def _sine_gen(self, f0: torch.Tensor) -> torch.Tensor:
+        """f0: (B, 1, N). Returns sine_waves: (B, harmonic+1, N).
+
+        Exactly reproduces chatterbox.models.s3gen.hifigan.SineGen.forward but
+        with no in-place scatter writes. `phase_vec` is still baked in from
+        the traced random sample (same as upstream at export time -- the
+        reference script uses the same approach).
+        """
+        sg = self.m_source.l_sin_gen
+        H = sg.harmonic_num + 1
+        # harmonics = [1, 2, ..., H], broadcast over (B, H, N)
+        harmonics = torch.arange(1, H + 1, device=f0.device, dtype=f0.dtype).view(1, H, 1)
+        F_mat = f0 * harmonics / sg.sampling_rate  # (B, H, N)
+
+        theta_mat = 2 * torch.pi * (torch.cumsum(F_mat, dim=-1) % 1)
+
+        # Deterministic phase offset -- precomputed at __init__ to avoid
+        # aten::uniform in the trace (opset 17 cannot export it).
+        phase_vec = self.sine_phase_vec.to(dtype=f0.dtype, device=f0.device)
+        sine_waves = sg.sine_amp * torch.sin(theta_mat + phase_vec)
+
+        uv = (f0 > sg.voiced_threshold).to(f0.dtype)
+        noise_amp = uv * sg.noise_std + (1 - uv) * sg.sine_amp / 3
+        noise = noise_amp * torch.randn_like(sine_waves)
+        sine_waves = sine_waves * uv + noise
+        return sine_waves, uv
+
+    def _source_module(self, x: torch.Tensor) -> torch.Tensor:
+        """Scatter-free replacement for SourceModuleHnNSF.forward."""
+        sine_wavs, uv = self._sine_gen(x.transpose(1, 2))  # (B, H, N)
+        sine_wavs = sine_wavs.transpose(1, 2)  # (B, N, H)
+        sine_merge = self.m_source.l_tanh(self.m_source.l_linear(sine_wavs))
+        return sine_merge
+
+    # ------------------------------------------------------------------
+    # HiFi-GAN forward -- mel -> waveform
+    # ------------------------------------------------------------------
+    def _hifigan_decode(self, speech_feat: torch.Tensor) -> torch.Tensor:
+        """
+        speech_feat: (B, 80, T_mel_gen)
+        returns:     (B, N_samples)
+        """
+        # mel -> f0 -> sine source (via our scatter-free SineGen)
+        f0 = self.f0_predictor(speech_feat)
+        s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # (B, N_samples_raw, 1)
+        s = self._source_module(s)
+        output_sources = s.transpose(1, 2).squeeze(1)  # (B, N_samples_raw)
+
+        # real-valued STFT (return_complex=False, for ONNX export)
+        spec = torch.stft(
+            output_sources,
+            self.n_fft,
+            self.hop_len,
+            self.n_fft,
+            window=self.stft_window.to(output_sources.device),
+            return_complex=False,
+        )
+        s_stft_real, s_stft_imag = spec[..., 0], spec[..., 1]
+        s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)  # (B, n_fft+2, T)
+
+        # HiFiGAN body
+        x = self.conv_pre(speech_feat)
+
+        # upsample 0
         x = F.leaky_relu(x, self.lrelu_slope)
         x = self.ups[0](x)
-
         si = self.source_downs[0](s_stft)
         si = self.source_resblocks[0](si)
         x = x + si
+        xs = (
+            self.resblocks[0](x) + self.resblocks[1](x) + self.resblocks[2](x)
+        )
+        x = xs / 3
 
-        xs0 = self.resblocks[0](x) + self.resblocks[1](x) + self.resblocks[2](x)
-        x = xs0 / 3
-
-        # ---- Upsample 1 ----
+        # upsample 1
         x = F.leaky_relu(x, self.lrelu_slope)
         x = self.ups[1](x)
-
         si = self.source_downs[1](s_stft)
         si = self.source_resblocks[1](si)
         x = x + si
+        xs = (
+            self.resblocks[3](x) + self.resblocks[4](x) + self.resblocks[5](x)
+        )
+        x = xs / 3
 
-        xs1 = self.resblocks[3](x) + self.resblocks[4](x) + self.resblocks[5](x)
-        x = xs1 / 3
-
-        # ---- Upsample 2 ----
+        # upsample 2 (last: reflection pad)
         x = F.leaky_relu(x, self.lrelu_slope)
         x = self.ups[2](x)
         x = self.reflection_pad(x)
-
         si = self.source_downs[2](s_stft)
         si = self.source_resblocks[2](si)
         x = x + si
+        xs = (
+            self.resblocks[6](x) + self.resblocks[7](x) + self.resblocks[8](x)
+        )
+        x = xs / 3
 
-        xs2 = self.resblocks[6](x) + self.resblocks[7](x) + self.resblocks[8](x)
-        x = xs2 / 3
-
-        # ---- Final layers ----
+        # final
         x = F.leaky_relu(x)
         x = self.conv_post(x)
+        magnitude = torch.exp(x[:, : self.n_fft // 2 + 1, :])
+        phase = torch.sin(x[:, self.n_fft // 2 + 1 :, :])
 
-        magnitude = torch.exp(x[:, :self.n_fft // 2 + 1, :])
-        phase = torch.sin(x[:, self.n_fft // 2 + 1:, :])
-
-        return magnitude, phase
-
-    def forward(self, speech_tokens, speaker_embeddings, speaker_features):
-        token_len = torch.full((speech_tokens.size(0),), speech_tokens.size(1), dtype=torch.long, device=speech_tokens.device)
-        mask = (~make_pad_mask(token_len)).unsqueeze(-1)
-        mel_len1, mel_len2, mu, spks, cond = self.flow_forward(speech_tokens, token_len, mask, speaker_embeddings, speaker_features)
-        mu = mu.transpose(1, 2).contiguous()
-        total_len = mel_len1.add(mel_len2).unsqueeze(0)
-        mask = (~make_pad_mask(total_len)).unsqueeze(0)
-        n_timesteps = 10
-        temperature = 1.0
-        x = torch.randn_like(mu, dtype=mu.dtype) * temperature
-        t_span = torch.linspace(0, 1, n_timesteps+1, device=mu.device, dtype=mu.dtype)
-        t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        dt_all = t_span[1:] - t_span[:-1]
-
-        t = t_span[0:1]
-        dt = dt_all[0:1]
-
-        x_in = torch.cat([x, torch.zeros_like(x)], dim=0) 
-        mask_in = torch.cat([mask, torch.zeros_like(mask)], dim=0) 
-        mu_in = torch.cat([mu, torch.zeros_like(mu)], dim=0) 
-        t_in = torch.cat([t, torch.zeros_like(t)], dim=0) 
-        spks_in = torch.cat([spks, torch.zeros_like(spks)], dim=0) 
-        cond_in = torch.cat([cond, torch.zeros_like(cond)], dim=0)
-
-        ## Classifier-Free Guidance inference introduced in VoiceBox
-        # step 1
-        dphi_dt = self.cond_forward(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-        dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-        x = x + dt * dphi_dt
-        t = t + dt
-        dt = t_span[1 + 1] - t
-
-        # step 2
-        x_in[:].copy_(x.squeeze(0)) 
-        mask_in[:].copy_(mask.squeeze(0))
-        mu_in[0].copy_(mu.squeeze(0))
-        t_in[:].copy_(t.squeeze(0))
-        spks_in[0].copy_(spks.squeeze(0))
-        cond_in[0].copy_(cond.squeeze(0))
-        dphi_dt = self.cond_forward(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-        dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-        x = x + dt * dphi_dt
-        t = t + dt
-        dt = t_span[2 + 1] - t
-
-        # step 3
-        x_in[:].copy_(x.squeeze(0)) 
-        mask_in[:].copy_(mask.squeeze(0))
-        mu_in[0].copy_(mu.squeeze(0))
-        t_in[:].copy_(t.squeeze(0))
-        spks_in[0].copy_(spks.squeeze(0))
-        cond_in[0].copy_(cond.squeeze(0))
-        dphi_dt = self.cond_forward(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-        dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-        x = x + dt * dphi_dt
-        t = t + dt
-        dt = t_span[3 + 1] - t
-
-        # step 4
-        x_in[:].copy_(x.squeeze(0)) 
-        mask_in[:].copy_(mask.squeeze(0))
-        mu_in[0].copy_(mu.squeeze(0))
-        t_in[:].copy_(t.squeeze(0))
-        spks_in[0].copy_(spks.squeeze(0))
-        cond_in[0].copy_(cond.squeeze(0))
-        dphi_dt = self.cond_forward(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-        dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-        x = x + dt * dphi_dt
-        t = t + dt
-        dt = t_span[4 + 1] - t
-
-        # step 5
-        x_in[:].copy_(x.squeeze(0)) 
-        mask_in[:].copy_(mask.squeeze(0))
-        mu_in[0].copy_(mu.squeeze(0))
-        t_in[:].copy_(t.squeeze(0))
-        spks_in[0].copy_(spks.squeeze(0))
-        cond_in[0].copy_(cond.squeeze(0))
-        dphi_dt = self.cond_forward(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-        dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-        x = x + dt * dphi_dt
-        t = t + dt
-        dt = t_span[5 + 1] - t
-
-        # step 6
-        x_in[:].copy_(x.squeeze(0)) 
-        mask_in[:].copy_(mask.squeeze(0))
-        mu_in[0].copy_(mu.squeeze(0))
-        t_in[:].copy_(t.squeeze(0))
-        spks_in[0].copy_(spks.squeeze(0))
-        cond_in[0].copy_(cond.squeeze(0))
-        dphi_dt = self.cond_forward(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-        dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-        x = x + dt * dphi_dt
-        t = t + dt
-        dt = t_span[6 + 1] - t
-
-        # step 7
-        x_in[:].copy_(x.squeeze(0)) 
-        mask_in[:].copy_(mask.squeeze(0))
-        mu_in[0].copy_(mu.squeeze(0))
-        t_in[:].copy_(t.squeeze(0))
-        spks_in[0].copy_(spks.squeeze(0))
-        cond_in[0].copy_(cond.squeeze(0))
-        dphi_dt = self.cond_forward(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-        dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-        x = x + dt * dphi_dt
-        t = t + dt
-        dt = t_span[7 + 1] - t
-
-        # step 8
-        x_in[:].copy_(x.squeeze(0)) 
-        mask_in[:].copy_(mask.squeeze(0))
-        mu_in[0].copy_(mu.squeeze(0))
-        t_in[:].copy_(t.squeeze(0))
-        spks_in[0].copy_(spks.squeeze(0))
-        cond_in[0].copy_(cond.squeeze(0))
-        dphi_dt = self.cond_forward(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-        dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-        x = x + dt * dphi_dt
-        t = t + dt
-        dt = t_span[8 + 1] - t
-
-        # step 9
-        x_in[:].copy_(x.squeeze(0)) 
-        mask_in[:].copy_(mask.squeeze(0))
-        mu_in[0].copy_(mu.squeeze(0))
-        t_in[:].copy_(t.squeeze(0))
-        spks_in[0].copy_(spks.squeeze(0))
-        cond_in[0].copy_(cond.squeeze(0))
-        dphi_dt = self.cond_forward(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-        dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-        x = x + dt * dphi_dt
-        t = t + dt
-        dt = t_span[9 + 1] - t
-
-        # step 10
-        x_in[:].copy_(x.squeeze(0)) 
-        mask_in[:].copy_(mask.squeeze(0))
-        mu_in[0].copy_(mu.squeeze(0))
-        t_in[:].copy_(t.squeeze(0))
-        spks_in[0].copy_(spks.squeeze(0))
-        cond_in[0].copy_(cond.squeeze(0))
-        dphi_dt = self.cond_forward(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-        dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-        x = x + dt * dphi_dt
-        output = x.float()
-        speech_feat = torch.narrow(output, dim=2, start=mel_len1, length=output.size(2) - mel_len1)
-        #mel->f0
-        f0 = self.f0_predictor(speech_feat)
-        # f0->source
-        s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
-        s, _, _ = self.m_source(s)
-        output_sources = s.transpose(1, 2).squeeze(1)
-        spec = torch.stft(
-            output_sources,
-            self.n_fft, 
-            self.hop_len, 
-            self.n_fft, 
-            window=self.stft_window.to(output_sources.device),
-            return_complex=False)
-        s_stft_real, s_stft_imag = spec[..., 0], spec[..., 1]
-        output_sources = torch.cat([s_stft_real, s_stft_imag], dim=1)
-        magnitude, phase = self.decode(x=speech_feat, s_stft=output_sources)
         magnitude = torch.clip(magnitude, max=1e2)
         real = magnitude * torch.cos(phase)
         img = magnitude * torch.sin(phase)
-        recombine_magnitude_phase = torch.cat([real, img], dim=1)
-        output_wavs = self.istft(recombine_magnitude_phase)
-        trim_fade = torch.zeros(2 * self.n_trim)
-        cosine_window = (torch.cos(torch.linspace(torch.pi, 0, self.n_trim)) + 1) / 2
-        trim_fade[self.n_trim:] = cosine_window
-        output_wavs[:, :trim_fade.size(0)] *= trim_fade
-        return output_wavs
+        rebuild = torch.cat([real, img], dim=1)
+        wavs = self.istft(rebuild)
+
+        # fade-in on first 2*n_trim samples, hard-limited
+        trim_fade = self.trim_fade.to(dtype=wavs.dtype, device=wavs.device)
+        # Build a per-sample scale: first len(trim_fade) samples are fade-in,
+        # the rest are 1.0. We do this scatter-free by cat.
+        ones = torch.ones(wavs.size(1) - trim_fade.size(0), dtype=wavs.dtype, device=wavs.device)
+        scale = torch.cat([trim_fade, ones], dim=0)
+        wavs = wavs * scale.unsqueeze(0)
+        wavs = torch.clamp(wavs, -self.audio_limit, self.audio_limit)
+        return wavs
+
+    # ------------------------------------------------------------------
+    # Public forward
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        speech_tokens: torch.Tensor,       # (B, N_tok)  int64
+        speaker_embeddings: torch.Tensor,  # (B, 192)    float
+        speaker_features: torch.Tensor,    # (B, N_mel_prompt, 80) float
+    ) -> torch.Tensor:
+        mel_len1, mu, spks, cond, mask = self._flow_encode(
+            speech_tokens, speaker_embeddings, speaker_features
+        )
+        mel = self._cfm_solve(mu, mask, spks, cond)  # (B, 80, T_mel_total)
+        # trim off the prompt portion
+        mel_gen = mel[:, :, mel_len1:]
+        wavs = self._hifigan_decode(mel_gen)
+        return wavs
 
 
+# ---------------------------------------------------------------------------
+# Build dummy speaker inputs by running the reference embed_ref on a reference
+# audio clip. Used both to drive the torch trace and to build ORT smoke inputs.
+# ---------------------------------------------------------------------------

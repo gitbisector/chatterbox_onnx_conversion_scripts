@@ -16,10 +16,59 @@ import torch
 import torchaudio as ta
 import librosa
 
+# ---- torch 2.13+ compatibility ----
+# chatterbox-tts's hot-path methods (s3gen, t3, flow_matching, ...) are
+# decorated with ``@torch.inference_mode()``.  torch 2.13 made the legacy
+# TorchScript ONNX exporter strict about inference-mode tensors: tracing runs
+# under autograd to capture shape info, and autograd refuses to save
+# inference-mode tensors for backward, so any op reached through those
+# decorators fails the trace with "Inference tensors cannot be saved for
+# backward."  Aliasing ``torch.inference_mode`` → ``torch.no_grad`` *before*
+# chatterbox's modules import gives us the same grad-off semantics with
+# normal (traceable) tensors.  No-op on older torch where the strict check
+# doesn't exist.  Must come before any ``from chatterbox.* import ...``.
+torch.inference_mode = torch.no_grad
+
 from ._constants import S3GEN_SR, START_SPEECH_TOKEN, EXAGGERATION_TOKEN
 from .export_speech_encoder import PrepareConditionalsModel, SafeDenseLayer
 from .export_embed_tokens import InputsEmbeds
 from .export_conditional_decoder import ConditionalDecoder
+
+
+def _freeze_all(obj, _seen=None):
+    """Set ``requires_grad=False`` on every tensor/parameter reachable from obj.
+
+    torch 2.13's legacy exporter also rejects parameters with
+    ``requires_grad=True`` when it would otherwise inline them as constants
+    ("Cannot insert a Tensor that requires grad as a constant").  The upstream
+    chatterbox model leaves parameters trainable by default, so we sweep them
+    here.  Harmless on older torch.
+    """
+    if _seen is None:
+        _seen = set()
+    if id(obj) in _seen:
+        return
+    _seen.add(id(obj))
+    if isinstance(obj, torch.nn.Module):
+        for p in obj.parameters():
+            if p.requires_grad:
+                p.requires_grad_(False)
+        return
+    if isinstance(obj, torch.Tensor):
+        if obj.requires_grad:
+            obj.requires_grad_(False)
+        return
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            _freeze_all(v, _seen)
+        return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _freeze_all(v, _seen)
+        return
+    if hasattr(obj, "__dict__"):
+        for v in obj.__dict__.values():
+            _freeze_all(v, _seen)
 
 
 @torch.no_grad()
@@ -44,12 +93,16 @@ def export_model_to_onnx(
         from chatterbox.tts import ChatterboxTTS
         chatterbox_model = ChatterboxTTS.from_pretrained(device=device)
 
+    _freeze_all(chatterbox_model)
+
     # replace DenseLayer of speake_encoder on custom SafeDenseLayer with exchanging BatchNorm1d layer on LayerNorm for ONNX export compatibility
     # we can safely do that because it does not affect inference as we do no need matching training dynamics
     # TODO Probably move this logic somewhere else outside export script
     old_dense = chatterbox_model.s3gen.speaker_encoder.xvector.dense
-    chatterbox_model.s3gen.speaker_encoder.xvector.dense = SafeDenseLayer(old_dense.linear.in_channels, old_dense.linear.out_channels)
-    chatterbox_model.s3gen.speaker_encoder.xvector.dense.linear.weight.copy_(old_dense.linear.weight)
+    new_dense = SafeDenseLayer(old_dense.linear.in_channels, old_dense.linear.out_channels)
+    new_dense.linear.weight.data.copy_(old_dense.linear.weight.data)
+    _freeze_all(new_dense)
+    chatterbox_model.s3gen.speaker_encoder.xvector.dense = new_dense
 
     prepare_conditionals = PrepareConditionalsModel(chatterbox_model).eval()
     embed_tokens = InputsEmbeds(chatterbox_model).eval()

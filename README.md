@@ -39,7 +39,7 @@ This project aims to make it easier to:
 | Model Name                | Source                    | Notes                                  | Original repo                                            | ONNX repo
 | -----------------         | ------------------------  | -------------------------------------  | ---------------                                          | ------------
 | Chatterbox                | resemble-ai/chatterbox-tts| Text to Speech, Speech to Speech       | [GitHub Link](https://github.com/resemble-ai/chatterbox) | [HF Link](https://huggingface.co/onnx-community/chatterbox-ONNX)
-| Chatterbox Multilingual   | resemble-ai/chatterbox-tts| Text to Speech, Speech to Speech       | [GitHub Link](https://github.com/resemble-ai/chatterbox) | [HF Link](https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX)
+| Chatterbox Multilingual   | resemble-ai/chatterbox-tts| Text to Speech, Speech to Speech — [v2 notes](chatterbox/README.md): CFG + alignment-attention fixes, scatter-free graphs, fp16, ~1.8× faster than PyTorch BF16 on DGX Spark | [GitHub Link](https://github.com/resemble-ai/chatterbox) | [HF Link](https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX)
 | Perth Watermarker         | resemble-ai/Perth         | Audio Watermarking                     | [GitHub Link](https://github.com/resemble-ai/Perth)      | [HF Link](https://huggingface.co/onnx-community/perth-watermarker-ONNX)
 | ...                       | ...                       | ...                                    | ...                                                      | ...
 

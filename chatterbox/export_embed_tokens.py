@@ -1,115 +1,148 @@
 """Export Chatterbox's input embedding layer (text/speech tokens + positions → embeddings).
 
-The ``InputsEmbeds`` wrapper replaces Chatterbox's multi-step embedding lookup
-with a single ONNX-traceable graph. Given ``(input_ids, position_ids, exaggeration)``
+The ``InputsEmbeds`` wrapper exports the text/speech token embedding path to a
+single ONNX-traceable graph.  Given ``(input_ids, position_ids, exaggeration)``
 it returns the per-token embeddings that feed into the T3 language model.
 
-The original monolithic export lived in ``chatterbox_to_onnx_conversion_script.py``;
-this split separates it from the speech encoder and conditional decoder exports
-without changing behavior.
+This version differs from the original monolithic export in three ways:
+
+1. **Scatter-free**  — PyTorch's ONNX exporter emits ``ScatterND`` whenever it
+   sees a ``torch.zeros(...)`` seed followed by conditional in-place fills
+   (the pattern the original ``InputsEmbeds`` used).  ScatterND nodes
+   prevent ORT CUDA-graph capture downstream.  This implementation computes
+   every branch as a full tensor and combines them with elementwise masks,
+   so the exporter emits only ``Where`` / ``Mul`` / ``Add`` / ``Gather``.
+2. **Batch=2 CFG-aware**  — The multilingual T3 model is trained for
+   classifier-free guidance (cond + uncond rows, with the uncond row's text
+   embeddings zeroed).  The upstream export assumed batch=1; this one
+   supports the two-row prefill directly in the graph, so an inference loop
+   can run CFG without a second pass through the embedder.  Batch=1 callers
+   are unaffected.
+3. **fp16 weights**  — Halves memory footprint.  The exaggeration scalar
+   input stays fp32 and is cast to fp16 immediately after the Linear.
+
+Interface is identical to the upstream export (inputs
+``input_ids, position_ids, exaggeration``; output ``inputs_embeds``), so the
+driver in ``chatterbox_to_onnx_conversion_script.py`` needs no changes.
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from ._constants import (
-    START_SPEECH_TOKEN, STOP_SPEECH_TOKEN, EXAGGERATION_TOKEN,
-)
-
-
+from ._constants import START_SPEECH_TOKEN, EXAGGERATION_TOKEN
 
 
 class InputsEmbeds(nn.Module):
+    """Scatter-free, fp16, CFG-aware input embedder for Chatterbox.
+
+    Replaces the original ``InputsEmbeds`` class.  Same external interface:
+    constructed with the chatterbox model, called with
+    ``(input_ids, position_ids, exaggeration)``.
+
+    Key rewrite tricks:
+
+    * Never seed a tensor with ``torch.zeros(...)`` and conditionally fill —
+      the exporter traces that into ``ScatterND``.  Instead, compute every
+      branch as a full tensor and combine with elementwise masks.
+    * ``torch.where`` operates only on same-shape operands (no advanced
+      indexing, which also becomes ``ScatterND``).
+    * CFG row-1 zeroing uses ``torch.arange(B) == 1`` so the same graph works
+      for both batch=1 and batch=2 callers.
+    """
+
     def __init__(self, chatterbox):
         super().__init__()
-        self.text_emb = chatterbox.t3.text_emb
-        self.text_pos_emb = chatterbox.t3.text_pos_emb.emb
+        # Clone weights to fp16 in fresh modules so this wrapper is safe to drop
+        # into any pipeline without side-effects on the shared chatterbox model.
+        self.text_emb = self._clone_embedding_fp16(chatterbox.t3.text_emb)
+        self.text_pos_emb = self._clone_embedding_fp16(chatterbox.t3.text_pos_emb.emb)
+        self.speech_emb = self._clone_embedding_fp16(chatterbox.t3.speech_emb)
+        self.speech_pos_emb = self._clone_embedding_fp16(chatterbox.t3.speech_pos_emb.emb)
 
-        self.speech_emb = chatterbox.t3.speech_emb
-        self.speech_pos_emb = chatterbox.t3.speech_pos_emb.emb
+        # emotion_adv_fc: (1, n_channels), no bias.  Keep weights in fp16 and
+        # cast the fp32 scalar input to fp16 before the matmul.
+        src = chatterbox.t3.cond_enc.emotion_adv_fc
+        self.emotion_adv_fc = nn.Linear(
+            src.in_features, src.out_features, bias=src.bias is not None
+        ).to(torch.float16)
+        with torch.no_grad():
+            self.emotion_adv_fc.weight.copy_(src.weight.to(torch.float16))
+            if src.bias is not None:
+                self.emotion_adv_fc.bias.copy_(src.bias.to(torch.float16))
 
-        self.emotion_adv_fc = chatterbox.t3.cond_enc.emotion_adv_fc
+        self.start_speech_token = int(START_SPEECH_TOKEN)
+        self.exaggeration_token = int(EXAGGERATION_TOKEN)
 
-    def forward(self, input_ids, position_ids, exaggeration):
-        assert position_ids.shape == input_ids.shape
+    @staticmethod
+    def _clone_embedding_fp16(emb: nn.Embedding) -> nn.Embedding:
+        out = nn.Embedding(emb.num_embeddings, emb.embedding_dim).to(torch.float16)
+        with torch.no_grad():
+            out.weight.copy_(emb.weight.to(torch.float16))
+        return out
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,   # (B, S) int64
+        position_ids: torch.Tensor,  # (B, S) int64
+        exaggeration: torch.Tensor,  # (1,) float32
+    ) -> torch.Tensor:
+        """Returns (B, S, 1024) float16."""
         batch_size, seq_len = input_ids.shape
 
-        x = input_ids
-        idx = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
-        
-        # Detect first zero
-        is_zero = (x == 0)
-        has_zero = is_zero.any(dim=1)
-        zero_pos = torch.where(
-            has_zero,
-            is_zero.float().argmax(dim=1),
-            torch.full((batch_size,), -1, device=x.device)  # placeholder
-        )
+        # Build text / speech / exaggeration masks.  The first "0" in each row
+        # marks the boundary between text prefix and speech suffix.  Rows
+        # without a 0 are all-speech (matches autoregressive decode calls).
+        idx = torch.arange(seq_len, device=input_ids.device, dtype=input_ids.dtype)
+        idx = idx.unsqueeze(0).expand(batch_size, -1)  # (B, S)
 
-        # Masks
-        exaggeration_mask = (x == EXAGGERATION_TOKEN)
+        is_zero = input_ids == 0
+        has_zero = is_zero.any(dim=1)  # (B,)
+        # argmax on bool is unsupported by some ONNX opsets — cast to int64.
+        first_zero = is_zero.to(torch.int64).argmax(dim=1)  # (B,), 0 if no zero
+        minus_one = torch.full_like(first_zero, -1)
+        zero_pos = torch.where(has_zero, first_zero, minus_one)  # (B,)
+
+        exaggeration_mask = input_ids == self.exaggeration_token
         base_text_mask = (idx <= zero_pos.unsqueeze(1)) & has_zero.unsqueeze(1)
-        
         text_mask = base_text_mask & ~exaggeration_mask
         speech_mask = ~base_text_mask & ~exaggeration_mask
 
-        # Compute relative positions by multiplying with the masks
-        text_pos_ids = position_ids * text_mask
-        speech_pos_ids = position_ids * speech_mask
+        # Safe indices: mask ids to 0 on "off" positions so the lookup returns
+        # a valid row that we then multiply by the mask (zeroing it) and sum
+        # with the other branch.
+        zero_idx = torch.zeros_like(input_ids)
+        safe_text_ids = torch.where(text_mask, input_ids, zero_idx)
+        safe_speech_ids = torch.where(speech_mask, input_ids, zero_idx)
+        text_pos_ids = position_ids * text_mask.to(position_ids.dtype)
+        speech_pos_ids = position_ids * speech_mask.to(position_ids.dtype)
 
-        # Flatten
-        flat_x = x.view(-1)
-        flat_text_mask = text_mask.view(-1)
-        flat_speech_mask = speech_mask.view(-1)
-        flat_exaggeration_mask = exaggeration_mask.view(-1)
-        flat_text_pos = text_pos_ids.view(-1)
-        flat_speech_pos = speech_pos_ids.view(-1)
+        text_part = self.text_emb(safe_text_ids) + self.text_pos_emb(text_pos_ids)
+        speech_part = self.speech_emb(safe_speech_ids) + self.speech_pos_emb(speech_pos_ids)
 
-        # Replace invalid indices with 0 (safe padding idx)
-        safe_text_idx = torch.where(flat_text_mask, flat_x, torch.zeros_like(flat_x))
-        safe_text_pos = torch.where(flat_text_mask, flat_text_pos, torch.zeros_like(flat_text_pos))
+        text_mask_f = text_mask.to(torch.float16).unsqueeze(-1)
+        speech_mask_f = speech_mask.to(torch.float16).unsqueeze(-1)
+        exag_mask_f = exaggeration_mask.to(torch.float16).unsqueeze(-1)
 
-        safe_speech_idx = torch.where(flat_speech_mask, flat_x, torch.zeros_like(flat_x))
-        safe_speech_pos = torch.where(flat_speech_mask, flat_speech_pos, torch.zeros_like(flat_speech_pos))
+        # CFG: zero the text portion of row 1 when B >= 2.  Rather than
+        # branching on batch size (which the exporter would bake statically),
+        # build a per-row scale: row 0 → 1.0, row 1 → 0.0, other → 1.0.
+        # Works identically for B=1 (no scaling) and B=2 (CFG).
+        row_ids = torch.arange(batch_size, device=input_ids.device)
+        cfg_text_scale = torch.where(
+            row_ids == 1,
+            torch.zeros((), dtype=torch.float16, device=input_ids.device),
+            torch.ones((), dtype=torch.float16, device=input_ids.device),
+        ).view(batch_size, 1, 1)
+        text_part = text_part * cfg_text_scale
 
-        # Embed everything, but irrelevant positions will become "padding" embeddings
-        all_text_emb = self.text_emb(safe_text_idx) + self.text_pos_emb(safe_text_pos)
-        all_speech_emb = self.speech_emb(safe_speech_idx) + self.speech_pos_emb(safe_speech_pos)
+        # Emotion-adv embedding for EXAGGERATION_TOKEN positions.
+        exag_val = exaggeration.to(torch.float16).view(1, 1, 1)
+        exag_embed = self.emotion_adv_fc(exag_val)  # (1, 1, D) → broadcasts
 
-        # Finally, mask out the padding positions to zero them
-        text_emb = all_text_emb * flat_text_mask.unsqueeze(-1)
-        speech_emb = all_speech_emb * flat_speech_mask.unsqueeze(-1)
-
-        # Emotion Adv: must provide a value if this model uses emotion conditioning
-        emotion_adv = exaggeration.view(-1, 1, 1)
-        cond_emotion_adv = self.emotion_adv_fc(emotion_adv)
-
-        # Reshape to [B*L, D] to match masks
-        embed_dim = text_emb.size(-1)
-        text_emb_full   = text_emb
-        speech_emb_full = speech_emb
-
-        # Start with zeros
-        out = torch.zeros(batch_size * seq_len, embed_dim, device=x.device, dtype=text_emb.dtype)
-
-        # Where text mask is True → take text_emb, else keep current out
-        out = torch.where(flat_text_mask.unsqueeze(-1), text_emb_full, out)
-
-        # Where speech mask is True → take speech_emb, else keep current out
-        out = torch.where(flat_speech_mask.unsqueeze(-1), speech_emb_full, out)
-        
-        # Handle exaggeration tokens
-        # We need to expand cond_emotion_adv to match the number of exaggeration tokens
-        # This assumes cond_emotion_adv is (batch_size, 1, dim) and we need to map it correctly
-        # to the flattened positions.
-        # We can create an index mapping from the flattened index to the batch index.
-        batch_indices = torch.arange(batch_size, device=x.device).unsqueeze(1).expand(-1, seq_len).reshape(-1)
-        exaggeration_emb_full = cond_emotion_adv[batch_indices].transpose(0, 1) 
-
-        # Zero out positions where mask is False
-        exaggeration_emb = exaggeration_emb_full * flat_exaggeration_mask.unsqueeze(-1)
-
-        out = out + exaggeration_emb
-        out = out.view(batch_size, seq_len, embed_dim)
-        return out
-
+        # Combine: each position is exactly one of text/speech/exag/off, so
+        # masked addition is correct and requires no scatter.
+        out = (
+            text_part * text_mask_f
+            + speech_part * speech_mask_f
+            + exag_embed * exag_mask_f
+        )
+        return out  # (B, S, D) fp16
